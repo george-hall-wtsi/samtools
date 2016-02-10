@@ -1545,17 +1545,19 @@ typedef struct {
     int index;
 } worker_t;
 
-static void write_buffer(const char *fn, const char *mode, size_t l, bam1_p *buf, const bam_hdr_t *h, int n_threads, const htsFormat *fmt)
+// Returns 0 for success
+//        -1 for failure
+static int write_buffer(const char *fn, const char *mode, size_t l, bam1_p *buf, const bam_hdr_t *h, int n_threads, const htsFormat *fmt)
 {
     size_t i;
     samFile* fp;
     fp = sam_open_format(fn, mode, fmt);
-    if (fp == NULL) return;
-    sam_hdr_write(fp, h);
+    if (fp == NULL) return -1;
+    if (sam_hdr_write(fp, h) != 0) return -1;
     if (n_threads > 1) hts_set_threads(fp, n_threads);
     for (i = 0; i < l; ++i)
-        sam_write1(fp, h, buf[i]);
-    sam_close(fp);
+        if (sam_write1(fp, h, buf[i]) < 0) return -1;
+    return sam_close(fp);
 }
 
 static void *worker(void *data)
@@ -1565,7 +1567,10 @@ static void *worker(void *data)
     ks_mergesort(sort, w->buf_len, w->buf, 0);
     name = (char*)calloc(strlen(w->prefix) + 20, 1);
     sprintf(name, "%s.%.4d.bam", w->prefix, w->index);
-    write_buffer(name, "wb1", w->buf_len, w->buf, w->h, 0, NULL);
+    if (write_buffer(name, "wbx1", w->buf_len, w->buf, w->h, 0, NULL) != 0) {
+        free(name);
+        return (void *)1;
+    }
 
 // Consider using CRAM temporary files if the final output is CRAM.
 // Typically it is comparable speed while being smaller.
@@ -1588,6 +1593,7 @@ static int sort_blocks(int n_files, size_t k, bam1_p *buf, const char *prefix, c
     pthread_t *tid;
     pthread_attr_t attr;
     worker_t *w;
+    int ret;
 
     if (n_threads < 1) n_threads = 1;
     if (k < n_threads * 64) n_threads = 1; // use a single thread if we only sort a small batch of records
@@ -1605,9 +1611,14 @@ static int sort_blocks(int n_files, size_t k, bam1_p *buf, const char *prefix, c
         b += w[i].buf_len; rest -= w[i].buf_len;
         pthread_create(&tid[i], &attr, worker, &w[i]);
     }
-    for (i = 0; i < n_threads; ++i) pthread_join(tid[i], 0);
+    ret = n_files + n_threads;
+    for (i = 0; i < n_threads; ++i) {
+        void *pret;
+        pthread_join(tid[i], &pret);
+        if (pret) ret = -1;
+    }
     free(tid); free(w);
-    return n_files + n_threads;
+    return ret;
 }
 
 /*!
@@ -1678,6 +1689,10 @@ int bam_sort_core_ext(int is_by_qname, const char *fn, const char *prefix,
         if (mem >= max_mem) {
             n_files = sort_blocks(n_files, k, buf, prefix, header, n_threads);
             mem = k = 0;
+            if (n_files == -1) {
+                ret = -1;
+                goto err;
+            }
         }
     }
     if (ret != -1) {
@@ -1689,10 +1704,15 @@ int bam_sort_core_ext(int is_by_qname, const char *fn, const char *prefix,
     // write the final output
     if (n_files == 0) { // a single block
         ks_mergesort(sort, k, buf, 0);
-        write_buffer(fnout, modeout, k, buf, header, n_threads, out_fmt);
+        if (write_buffer(fnout, modeout, k, buf, header, n_threads, out_fmt) == -1)
+            goto err;
     } else { // then merge
         char **fns;
         n_files = sort_blocks(n_files, k, buf, prefix, header, n_threads);
+        if (n_files == -1) {
+            ret = -1;
+            goto err;
+        }
         fprintf(stderr, "[bam_sort_core] merging from %d files...\n", n_files);
         fns = (char**)calloc(n_files, sizeof(char*));
         for (i = 0; i < n_files; ++i) {
