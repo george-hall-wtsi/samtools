@@ -128,6 +128,7 @@ typedef struct {
     int argc;
     char **argv;
     sam_global_args ga;
+    int all;
 } mplp_conf_t;
 
 typedef struct {
@@ -551,12 +552,56 @@ static int mpileup(mplp_conf_t *conf, int n, char **fn)
     bam_mplp_set_maxcnt(iter, max_depth);
     bcf1_t *bcf_rec = bcf_init1();
     int ret;
+    int last_tid = -1, last_pos = -1;
+
     // begin pileup
     while ( (ret=bam_mplp_auto(iter, &tid, &pos, n_plp, plp)) > 0) {
         if (conf->reg && (pos < beg0 || pos >= end0)) continue; // out of the region requested
         if (conf->bed && tid >= 0 && !bed_overlap(conf->bed, h->target_name[tid], pos, pos+1)) continue;
         mplp_get_ref(data[0], tid, &ref, &ref_len);
         //printf("tid=%d len=%d ref=%p/%s\n", tid, ref_len, ref, ref);
+
+        if (conf->all && !(conf->flag & MPLP_BCF)) {
+            // Deal with missing portion of current tid
+            if (conf->all > 1 && !conf->reg) {
+                while (tid > last_tid) {
+                    if (last_tid >= 0) {
+                        while (++last_pos < h->target_len[last_tid]) {
+                            if (conf->bed && bed_overlap(conf->bed, h->target_name[last_tid], last_pos, last_pos + 1) == 0)
+                                continue;
+                            fprintf(pileup_fp, "%s\t%d\t%c", h->target_name[last_tid], last_pos + 1,
+                                    (ref && last_pos < ref_len)? ref[last_pos] : 'N');
+                            for (i = 0; i < n; ++i) {
+                                fputs("\t0\t*\t*", pileup_fp);
+                                if (conf->flag & MPLP_PRINT_MAPQ) fputs("\t*", pileup_fp);
+                                if (conf->flag & MPLP_PRINT_POS) fputs("\t*", pileup_fp);
+                            }
+                            putc('\n', pileup_fp);
+                        }
+                    }
+                    last_tid++;
+                    last_pos = -1;
+                }
+            }
+
+            // Deal with missing portion of current tid
+            while (++last_pos < pos) {
+                if (conf->reg && last_pos < beg0) continue; // out of range; skip
+                if (conf->bed && bed_overlap(conf->bed, h->target_name[tid], last_pos, last_pos + 1) == 0)
+                    continue;
+                fprintf(pileup_fp, "%s\t%d\t%c", h->target_name[tid], last_pos + 1,
+                        (ref && last_pos < ref_len)? ref[last_pos] : 'N');
+                for (i = 0; i < n; ++i) {
+                    fputs("\t0\t*\t*", pileup_fp);
+                    if (conf->flag & MPLP_PRINT_MAPQ) fputs("\t*", pileup_fp);
+                    if (conf->flag & MPLP_PRINT_POS) fputs("\t*", pileup_fp);
+                }
+                putc('\n', pileup_fp);
+            }
+            last_tid = tid;
+            last_pos = pos;
+        }
+
         if (conf->flag & MPLP_BCF) {
             int total_depth, _ref0, ref16;
             for (i = total_depth = 0; i < n; ++i) total_depth += n_plp[i];
@@ -600,14 +645,17 @@ static int mpileup(mplp_conf_t *conf, int n, char **fn)
                     if (conf->flag & MPLP_PRINT_MAPQ) fputs("\t*", pileup_fp);
                     if (conf->flag & MPLP_PRINT_POS) fputs("\t*", pileup_fp);
                 } else {
+                    int n = 0;
                     for (j = 0; j < n_plp[i]; ++j) {
                         const bam_pileup1_t *p = plp[i] + j;
                         int c = p->qpos < p->b->core.l_qseq
                             ? bam_get_qual(p->b)[p->qpos]
                             : 0;
                         if (c >= conf->min_baseQ)
-                            pileup_seq(pileup_fp, plp[i] + j, pos, ref_len, ref);
+                            n++, pileup_seq(pileup_fp, plp[i] + j, pos, ref_len, ref);
                     }
+                    if (!n) putc('*', pileup_fp);
+                    n = 0;
                     putc('\t', pileup_fp);
                     for (j = 0; j < n_plp[i]; ++j) {
                         const bam_pileup1_t *p = plp[i] + j;
@@ -617,8 +665,11 @@ static int mpileup(mplp_conf_t *conf, int n, char **fn)
                         if (c >= conf->min_baseQ) {
                             c = c + 33 < 126? c + 33 : 126;
                             putc(c, pileup_fp);
+                            n++;
                         }
                     }
+                    if (!n) putc('*', pileup_fp);
+                    n = 0;
                     if (conf->flag & MPLP_PRINT_MAPQ) {
                         putc('\t', pileup_fp);
                         for (j = 0; j < n_plp[i]; ++j) {
@@ -628,8 +679,11 @@ static int mpileup(mplp_conf_t *conf, int n, char **fn)
                             c = plp[i][j].b->core.qual + 33;
                             if (c > 126) c = 126;
                             putc(c, pileup_fp);
+                            n++;
                         }
+                        if (!n) putc('*', pileup_fp);
                     }
+                    n = 0;
                     if (conf->flag & MPLP_PRINT_POS) {
                         putc('\t', pileup_fp);
                         int last = 0;
@@ -640,11 +694,36 @@ static int mpileup(mplp_conf_t *conf, int n, char **fn)
 
                             if (last++) putc(',', pileup_fp);
                             fprintf(pileup_fp, "%d", plp[i][j].qpos + 1); // FIXME: printf() is very slow...
+                            n++;
                         }
+                        if (!n) putc('*', pileup_fp);
                     }
                 }
             }
             putc('\n', pileup_fp);
+        }
+    }
+
+    if (conf->all) {
+        // Handle terminating region
+        while (last_tid < h->n_targets) {
+            while (++last_pos < h->target_len[last_tid]) {
+                if (last_pos >= end0) break;
+                if (conf->bed && bed_overlap(conf->bed, h->target_name[last_tid], last_pos, last_pos + 1) == 0)
+                    continue;
+                fprintf(pileup_fp, "%s\t%d\t%c", h->target_name[last_tid], last_pos + 1,
+                        (ref && last_pos < ref_len)? ref[last_pos] : 'N');
+                for (i = 0; i < n; ++i) {
+                    fputs("\t0\t*\t*", pileup_fp);
+                    if (conf->flag & MPLP_PRINT_MAPQ) fputs("\t*", pileup_fp);
+                    if (conf->flag & MPLP_PRINT_POS) fputs("\t*", pileup_fp);
+                }
+                putchar('\n');
+            }
+            last_tid++;
+            last_pos = -1;
+            if (conf->all < 2 || conf->reg)
+                break;
         }
     }
 
@@ -814,6 +893,8 @@ static void print_usage(FILE *fp, const mplp_conf_t *mplp)
 "Output options for mpileup format (without -g/-v):\n"
 "  -O, --output-BP         output base positions on reads\n"
 "  -s, --output-MQ         output mapping quality\n"
+"  -a                      output all positions (including zero depth)\n"
+"  -a -a (or -aa)          output absolutely all positions, including unused ref. sequences\n"
 "\n"
 "Output options for genotype likelihoods (when -g/-v is used):\n"
 "  -t, --output-tags LIST  optional tags to output:\n"
@@ -862,6 +943,7 @@ int bam_mpileup(int argc, char *argv[])
     mplp.argc = argc; mplp.argv = argv;
     mplp.rflag_filter = BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP;
     mplp.output_fname = NULL;
+    mplp.all = 0;
     sam_global_args_init(&mplp.ga);
 
     static const struct option lopts[] =
@@ -916,7 +998,7 @@ int bam_mpileup(int argc, char *argv[])
         {"platforms", required_argument, NULL, 'P'},
         {NULL, 0, NULL, 0}
     };
-    while ((c = getopt_long(argc, argv, "Agf:r:l:q:Q:uRC:BDSd:L:b:P:po:e:h:Im:F:EG:6OsVvxt:",lopts,NULL)) >= 0) {
+    while ((c = getopt_long(argc, argv, "Agf:r:l:q:Q:uRC:BDSd:L:b:P:po:e:h:Im:F:EG:6OsVvxt:a",lopts,NULL)) >= 0) {
         switch (c) {
         case 'x': mplp.flag &= ~MPLP_SMART_OVERLAPS; break;
         case  1 :
@@ -988,6 +1070,7 @@ int bam_mpileup(int argc, char *argv[])
             }
             break;
         case 't': mplp.fmt_flag |= parse_format_flag(optarg); break;
+        case 'a': mplp.all++; break;
         default:
             if (parse_sam_global_opt(c, optarg, lopts, &mplp.ga) == 0) break;
             /* else fall-through */
